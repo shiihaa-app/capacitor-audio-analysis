@@ -1,0 +1,68 @@
+{
+  "name": "@shiihaa/capacitor-audio-analysis",
+  "version": "1.0.0",
+  "description": "Native audio analysis for Capacitor iOS — bypasses broken WKWebView Web Audio API. Real-time RMS and frequency energy from the device microphone via AVAudioEngine.",
+  "main": "dist/plugin.cjs.js",
+  "module": "dist/esm/index.js",
+  "types": "dist/esm/index.d.ts",
+  "unpkg": "dist/plugin.js",
+  "exports": {
+    ".": {
+      "import": "./dist/esm/index.js",
+      "require": "./dist/plugin.cjs.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "ios/",
+    "CapacitorAudioAnalysis.podspec"
+  ],
+  "author": "Felix Zeller <felix@shiihaa.app>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shiihaa-app/capacitor-audio-analysis.git"
+  },
+  "bugs": {
+    "url": "https://github.com/shiihaa-app/capacitor-audio-analysis/issues"
+  },
+  "homepage": "https://github.com/shiihaa-app/capacitor-audio-analysis#readme",
+  "keywords": [
+    "capacitor",
+    "ios",
+    "audio",
+    "microphone",
+    "analysis",
+    "wkwebview",
+    "avfoundation",
+    "breathwork",
+    "biofeedback",
+    "rms",
+    "audio-analysis",
+    "native"
+  ],
+  "scripts": {
+    "build": "npm run clean && npm run docgen && tsc && rollup -c rollup.config.js",
+    "clean": "rimraf ./dist",
+    "docgen": "docgen --api AudioAnalysisPlugin --output-readme README.md --output-json dist/docs.json",
+    "lint": "eslint . --ext ts",
+    "fmt": "prettier --write --parser typescript 'src/**/*.ts'",
+    "verify": "npm run verify:ios",
+    "verify:ios": "cd ios && pod install && xcodebuild -workspace Plugin.xcworkspace -scheme Plugin -destination generic/platform=iOS && cd .."
+  },
+  "devDependencies": {
+    "@capacitor/docgen": "^0.2.2",
+    "@rollup/plugin-node-resolve": "^13.0.0",
+    "rimraf": "^3.0.2",
+    "rollup": "^2.32.0",
+    "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "@capacitor/core": "^8.0.0"
+  },
+  "capacitor": {
+    "ios": {
+      "src": "ios"
+    }
+  }
+}
