@@ -1,7 +1,7 @@
 {
   "name": "@shiihaa/capacitor-audio-analysis",
-  "version": "1.0.0",
-  "description": "Native audio analysis for Capacitor iOS — bypasses broken WKWebView Web Audio API. Real-time RMS and frequency energy from the device microphone via AVAudioEngine.",
+  "version": "1.1.0",
+  "description": "Native audio analysis for Capacitor iOS \u2014 bypasses broken WKWebView Web Audio API. Real-time RMS and frequency energy from the device microphone via AVAudioEngine.",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",
   "types": "dist/esm/index.d.ts",

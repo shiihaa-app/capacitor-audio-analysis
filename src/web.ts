@@ -47,46 +47,62 @@ export class AudioAnalysisWeb extends WebPlugin implements AudioAnalysisPlugin {
     gainNode.connect(this.analyser);
 
     const actualSampleRate = this.audioContext.sampleRate;
-    const dataArray = new Float32Array(this.analyser.fftSize);
+    const timeDomain = new Float32Array(this.analyser.fftSize);
+    const freqBinCount = this.analyser.frequencyBinCount;
+    const freqDomain = new Float32Array(freqBinCount); // dB values
+    const binWidth = actualSampleRate / this.analyser.fftSize;
+
+    // Precompute band/centroid bin ranges — mirror native implementation.
+    const bandStartBin = Math.max(1, Math.round(150 / binWidth));
+    const bandEndBin = Math.min(freqBinCount, Math.round(2500 / binWidth));
+    const centroidStartBin = Math.max(1, Math.round(80 / binWidth));
+    const centroidEndBin = Math.min(freqBinCount, Math.round(4000 / binWidth));
 
     this._isCapturing = true;
 
     const tick = () => {
       if (!this._isCapturing || !this.analyser) return;
 
-      this.analyser.getFloatTimeDomainData(dataArray);
-
-      // Raw RMS
+      // Time-domain → RMS
+      this.analyser.getFloatTimeDomainData(timeDomain);
       let sumSquares = 0;
-      for (let i = 0; i < dataArray.length; i++) {
-        sumSquares += dataArray[i] * dataArray[i];
+      for (let i = 0; i < timeDomain.length; i++) {
+        sumSquares += timeDomain[i] * timeDomain[i];
       }
-      const rawRms = Math.sqrt(sumSquares / dataArray.length);
-
-      // Smoothed RMS (the analyser's smoothingTimeConstant approximates native smoothing)
+      const rawRms = Math.sqrt(sumSquares / timeDomain.length);
       const rms = rawRms; // already smoothed via analyser; expose rawRms separately
 
-      // Band energy approximation (mean absolute value — mirrors native implementation)
-      let absSum = 0;
-      for (let i = 0; i < dataArray.length; i++) {
-        absSum += Math.abs(dataArray[i]);
+      // Frequency-domain (dB, range approx −100…0) → linear power for centroid + band energy
+      this.analyser.getFloatFrequencyData(freqDomain);
+
+      let bandPowerSum = 0;
+      for (let bin = bandStartBin; bin < bandEndBin; bin++) {
+        bandPowerSum += Math.pow(10, freqDomain[bin] / 10);
       }
-      const bandEnergy = absSum / dataArray.length;
+      const bandEnergy = Math.sqrt(bandPowerSum / Math.max(bandEndBin - bandStartBin, 1));
+
+      let num = 0;
+      let den = 0;
+      for (let bin = centroidStartBin; bin < centroidEndBin; bin++) {
+        const power = Math.pow(10, freqDomain[bin] / 10);
+        num += bin * binWidth * power;
+        den += power;
+      }
+      const centroid = den > 1e-9 ? Math.min(num / den, actualSampleRate / 2) : 0;
 
       const data: AudioData = {
         rms,
         rawRms,
         bandEnergy,
+        centroid,
         sampleRate: actualSampleRate,
       };
 
       this.notifyListeners('audioData', data);
-
       this.animationFrameId = requestAnimationFrame(tick);
     };
 
     this.animationFrameId = requestAnimationFrame(tick);
-
     return { started: true };
   }
 

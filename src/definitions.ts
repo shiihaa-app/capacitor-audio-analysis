@@ -44,10 +44,19 @@ export interface AudioData {
   rawRms: number;
 
   /**
-   * Mean absolute amplitude in the breath frequency band (~150–2500 Hz).
-   * Computed as a time-domain approximation; sufficient for breath detection.
+   * Energy in the breath frequency band (~150–2500 Hz) computed via FFT.
+   * Scaled roughly in the same range as `rawRms` for comparability.
    */
   bandEnergy: number;
+
+  /**
+   * Spectral centroid in Hz — the energy-weighted centre frequency of the signal
+   * within the 80–4000 Hz search band. Use to distinguish breath (typ. 200–800 Hz)
+   * from traffic/rumble (<150 Hz) and sibilant/metallic noise (>2000 Hz).
+   *
+   * Returns 0 when the spectrum is effectively silent (no meaningful centroid).
+   */
+  centroid: number;
 
   /**
    * Actual hardware sample rate in Hz (e.g. 44100 or 48000).
@@ -100,7 +109,7 @@ export interface AudioAnalysisPlugin {
    *
    * @example
    * const handle = await AudioAnalysis.addListener('audioData', (data) => {
-   *   console.log('RMS:', data.rms, 'Band energy:', data.bandEnergy);
+   *   console.log('RMS:', data.rms, 'Band energy:', data.bandEnergy, 'Centroid:', data.centroid);
    * });
    * // Later:
    * handle.remove();

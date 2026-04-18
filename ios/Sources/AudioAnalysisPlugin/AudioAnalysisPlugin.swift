@@ -1,6 +1,7 @@
 import Foundation
 import Capacitor
 import AVFoundation
+import Accelerate
 
 /// Native audio analysis plugin for Capacitor iOS.
 ///
@@ -11,11 +12,11 @@ import AVFoundation
 ///
 /// # Solution
 /// This plugin bypasses the Web Audio API entirely. It uses `AVAudioEngine` to install a tap
-/// directly on the input node, computes RMS energy and a breath-band energy estimate in native Swift,
-/// and pushes results to JavaScript via Capacitor's `notifyListeners` mechanism.
+/// directly on the input node, runs a Hann-windowed FFT via Accelerate's vDSP, and computes
+/// RMS energy, breath-band energy, and spectral centroid in native Swift.
 ///
 /// # Events
-/// Emits `audioData` events with `rms`, `rawRms`, `bandEnergy`, and `sampleRate` fields.
+/// Emits `audioData` events with `rms`, `rawRms`, `bandEnergy`, `centroid`, and `sampleRate` fields.
 @objc(AudioAnalysisPlugin)
 public class AudioAnalysisPlugin: CAPPlugin, CAPBridgedPlugin {
 
@@ -43,6 +44,28 @@ public class AudioAnalysisPlugin: CAPPlugin, CAPBridgedPlugin {
     /// Smoothing factor α for the EMA: output = (1−α)·prev + α·current.
     /// Lower values = more smoothing (slower response).
     private let smoothingAlpha: Float = 0.3
+
+    // MARK: - FFT state (reused across buffers)
+
+    /// FFT length (power of two). 2048 → ~23 Hz bin resolution at 48 kHz — ample for breath VAD.
+    private let fftSize: Int = 2048
+    private var fftLog2n: vDSP_Length = 11   // log2(2048)
+    private var fftSetup: FFTSetup?
+    private var hannWindow: [Float] = []
+
+    // Scratch buffers (allocated once in `start`, reused in the audio thread).
+    private var windowed: [Float] = []
+    private var realp: [Float] = []
+    private var imagp: [Float] = []
+    private var magSquared: [Float] = []
+
+    // Breath-band bin indices, computed once sample rate is known.
+    private var bandStartBin: Int = 0
+    private var bandEndBin: Int = 0
+
+    // Centroid search range bin indices (80–4000 Hz — excludes DC/rumble and sibilant hiss).
+    private var centroidStartBin: Int = 0
+    private var centroidEndBin: Int = 0
 
     // MARK: - Plugin methods
 
@@ -89,37 +112,89 @@ public class AudioAnalysisPlugin: CAPPlugin, CAPBridgedPlugin {
         let format = inputNode.outputFormat(forBus: 0)
         let sampleRate = format.sampleRate
 
+        // Initialise FFT infrastructure once per capture session.
+        setupFFT(sampleRate: sampleRate)
+
+        // Local captures for the audio thread (no self-references past the weak self).
+        let fftSize = self.fftSize
+        let bandStartBin = self.bandStartBin
+        let bandEndBin = self.bandEndBin
+        let centroidStartBin = self.centroidStartBin
+        let centroidEndBin = self.centroidEndBin
+        let nyquist = Float(sampleRate * 0.5)
+        let binWidth = Float(sampleRate) / Float(fftSize)
+
         /// Install a tap on the input node. The closure is called on a background audio thread.
         inputNode.installTap(onBus: 0, bufferSize: bufferSize, format: format) { [weak self] buffer, _ in
             guard let self = self, self.isRunning else { return }
             guard let channelData = buffer.floatChannelData?[0] else { return }
             let frameLength = Int(buffer.frameLength)
 
-            // Step 1: Compute RMS with software gain applied.
+            // ── Step 1: RMS over the full tap buffer (with software gain). ────────────────
             var sumSquares: Float = 0.0
             for i in 0..<frameLength {
                 let sample = channelData[i] * softwareGain
                 sumSquares += sample * sample
             }
-            let rawRms = sqrtf(sumSquares / Float(frameLength))
+            let rawRms = sqrtf(sumSquares / Float(max(frameLength, 1)))
 
-            // Step 2: Compute breath-band energy approximation (150–2500 Hz).
-            // A full FFT is more accurate but overkill for breath/biofeedback detection.
-            // We use mean absolute value as a lightweight proxy for band energy.
-            var absSum: Float = 0.0
-            for i in 0..<frameLength {
-                absSum += abs(channelData[i])
+            // ── Step 2: Copy up to fftSize samples, apply Hann window. ────────────────────
+            // If the buffer is smaller than fftSize we zero-pad (rare — tapBufferSize is 4096).
+            let copyCount = min(frameLength, fftSize)
+            if copyCount < fftSize {
+                // Zero-fill tail
+                for i in copyCount..<fftSize { self.windowed[i] = 0 }
             }
-            let bandEnergy = absSum / max(Float(frameLength), 1.0)
+            vDSP_vmul(channelData, 1, self.hannWindow, 1, &self.windowed, 1, vDSP_Length(copyCount))
 
-            // Step 3: Apply exponential moving average smoothing to RMS.
+            // ── Step 3: Real FFT via vDSP. ────────────────────────────────────────────────
+            guard let fftSetup = self.fftSetup else { return }
+
+            // Pack interleaved real array into split-complex form
+            self.windowed.withUnsafeBufferPointer { winPtr in
+                winPtr.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: fftSize / 2) { complexPtr in
+                    var split = DSPSplitComplex(realp: &self.realp, imagp: &self.imagp)
+                    vDSP_ctoz(complexPtr, 2, &split, 1, vDSP_Length(fftSize / 2))
+
+                    // Forward FFT
+                    vDSP_fft_zrip(fftSetup, &split, 1, self.fftLog2n, FFTDirection(FFT_FORWARD))
+
+                    // Magnitude squared per bin (skip unpacking scale — we only need relative weights)
+                    vDSP_zvmags(&split, 1, &self.magSquared, 1, vDSP_Length(fftSize / 2))
+                }
+            }
+
+            // ── Step 4: Breath-band energy (150–2500 Hz) from FFT magnitudes. ─────────────
+            var bandSum: Float = 0
+            if bandEndBin > bandStartBin {
+                vDSP_sve(&self.magSquared[bandStartBin], 1, &bandSum, vDSP_Length(bandEndBin - bandStartBin))
+            }
+            // Normalise: sqrt of mean power → amplitude-like scale, comparable to rawRms.
+            let bandCount = Float(max(bandEndBin - bandStartBin, 1))
+            let bandEnergy = sqrtf(bandSum / bandCount) / Float(fftSize)
+
+            // ── Step 5: Spectral centroid over 80–4000 Hz. ────────────────────────────────
+            var numerator: Float = 0
+            var denominator: Float = 0
+            for bin in centroidStartBin..<centroidEndBin {
+                let power = self.magSquared[bin]
+                let freq = Float(bin) * binWidth
+                numerator += freq * power
+                denominator += power
+            }
+            // If the spectrum is essentially silent in the search band, report 0 — JS side treats
+            // 0 as "no meaningful centroid, don't trust this frame".
+            let centroid: Float = denominator > 1e-9 ? min(numerator / denominator, nyquist) : 0.0
+
+            // ── Step 6: Smoothed RMS (EMA). ───────────────────────────────────────────────
             self.smoothedRMS = self.smoothedRMS * (1.0 - self.smoothingAlpha) + rawRms * self.smoothingAlpha
 
-            // Step 4: Emit event to JavaScript.
+            // ── Step 7: Emit event to JavaScript. ─────────────────────────────────────────
             self.notifyListeners("audioData", data: [
                 "rms": self.smoothedRMS,
                 "rawRms": rawRms,
                 "bandEnergy": bandEnergy,
+                "centroid": centroid,
                 "sampleRate": sampleRate
             ])
         }
@@ -146,6 +221,36 @@ public class AudioAnalysisPlugin: CAPPlugin, CAPBridgedPlugin {
 
     // MARK: - Private helpers
 
+    /// Allocate FFT setup, window, and scratch buffers. Called once per `start`.
+    private func setupFFT(sampleRate: Double) {
+        // FFTSetup is tied to log2(n); recreate if size ever changes (currently fixed).
+        if fftSetup == nil {
+            fftSetup = vDSP_create_fftsetup(fftLog2n, FFTRadix(kFFTRadix2))
+        }
+
+        // Hann window, length fftSize
+        hannWindow = [Float](repeating: 0, count: fftSize)
+        vDSP_hann_window(&hannWindow, vDSP_Length(fftSize), Int32(vDSP_HANN_NORM))
+
+        // Scratch
+        windowed = [Float](repeating: 0, count: fftSize)
+        realp = [Float](repeating: 0, count: fftSize / 2)
+        imagp = [Float](repeating: 0, count: fftSize / 2)
+        magSquared = [Float](repeating: 0, count: fftSize / 2)
+
+        // Precompute bin ranges (bin k → frequency k * sampleRate / fftSize).
+        let binWidth = sampleRate / Double(fftSize)
+        let nyquistBin = fftSize / 2
+
+        // Breath band: 150–2500 Hz
+        bandStartBin = max(1, Int((150.0 / binWidth).rounded()))
+        bandEndBin = min(nyquistBin, Int((2500.0 / binWidth).rounded()))
+
+        // Centroid search: 80–4000 Hz (excludes DC/rumble and sibilant hiss > 4 kHz).
+        centroidStartBin = max(1, Int((80.0 / binWidth).rounded()))
+        centroidEndBin = min(nyquistBin, Int((4000.0 / binWidth).rounded()))
+    }
+
     /// Tear down the audio engine and reset state.
     private func stopCapture() {
         audioEngine?.inputNode.removeTap(onBus: 0)
@@ -153,6 +258,16 @@ public class AudioAnalysisPlugin: CAPPlugin, CAPBridgedPlugin {
         audioEngine = nil
         isRunning = false
         smoothedRMS = 0.0
+
+        if let setup = fftSetup {
+            vDSP_destroy_fftsetup(setup)
+            fftSetup = nil
+        }
+        hannWindow.removeAll(keepingCapacity: false)
+        windowed.removeAll(keepingCapacity: false)
+        realp.removeAll(keepingCapacity: false)
+        imagp.removeAll(keepingCapacity: false)
+        magSquared.removeAll(keepingCapacity: false)
     }
 
     deinit {
